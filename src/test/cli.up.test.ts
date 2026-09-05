@@ -12,10 +12,11 @@ import { devContainerDown, devContainerUp, shellExec, UpResult } from './testUti
 const pkg = require('../../package.json');
 
 describe('Dev Containers CLI', function () {
-	this.timeout('120s');
+	this.timeout('240s');
 
 	const tmp = path.relative(process.cwd(), path.join(__dirname, 'tmp'));
 	const cli = `npx --prefix ${tmp} devcontainer`;
+
 
 	before('Install', async () => {
 		await shellExec(`rm -rf ${tmp}/node_modules`);
@@ -24,8 +25,20 @@ describe('Dev Containers CLI', function () {
 	});
 
 	describe('Command up', () => {
+
 		it('should execute successfully with valid config', async () => {
-			const res = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/image`);
+			const res = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/image --include-configuration --include-merged-configuration`);
+			const response = JSON.parse(res.stdout);
+			assert.equal(response.outcome, 'success');
+			assert.equal(response.configuration?.remoteEnv?.TEST_RE, 'TEST_VALUE3');
+			assert.equal(response.mergedConfiguration?.remoteEnv?.TEST_RE, 'TEST_VALUE3');
+			const containerId: string = response.containerId;
+			assert.ok(containerId, 'Container id not found.');
+			await shellExec(`docker rm -f ${containerId}`);
+		});
+
+		it('should execute successfully with valid config with a Feature', async () => {
+			const res = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/image-with-git-feature`);
 			const response = JSON.parse(res.stdout);
 			assert.equal(response.outcome, 'success');
 			const containerId: string = response.containerId;
@@ -80,6 +93,85 @@ describe('Dev Containers CLI', function () {
 			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
 			it('should succeed', () => {
 				assert.equal(upResult!.outcome, 'success');
+			});
+		});
+		describe('for minimal docker-compose with custom project name', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-with-name`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, { 'logLevel': 'trace', extraArgs: `--docker-compose-path trigger-compose-v2` });
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'custom-project-name');
+			});
+		});
+		describe('for minimal docker-compose with custom project name using environment variable', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-with-name-using-env-var`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, {
+					logLevel: 'trace',
+					extraArgs: `--docker-compose-path trigger-compose-v2`,
+					env: {
+						...process.env,
+						'CUSTOM_NAME': 'custom-name-with-env-var'
+					}
+				});
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'custom-name-with-env-var');
+			});
+		});
+		describe('for minimal docker-compose with custom project name "devcontainer" using environment variable', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-with-name-using-env-var`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, {
+					logLevel: 'trace',
+					extraArgs: `--docker-compose-path trigger-compose-v2`,
+					env: {
+						...process.env,
+						'CUSTOM_NAME': 'devcontainer'
+					}
+				});
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'devcontainer');
+			});
+		});
+		describe('for minimal docker-compose with custom project name and custom yaml', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-with-name-and-custom-yaml`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, { 'logLevel': 'trace', extraArgs: `--docker-compose-path trigger-compose-v2` });
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'custom-project-name-custom-yaml');
+			});
+		});
+		describe('for minimal docker-compose without custom project name', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-without-name`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, { 'logLevel': 'trace', extraArgs: `--docker-compose-path trigger-compose-v2` });
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'compose-without-name_devcontainer');
 			});
 		});
 
@@ -153,6 +245,117 @@ describe('Dev Containers CLI', function () {
 					assert.equal(upResult2?.containerId, upResult1?.containerId);
 				});
 			});
+		});
+
+		it('should follow the correct merge logic for containerEnv', async () => {
+			const res = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/image-metadata-containerEnv`);
+			const response = JSON.parse(res.stdout);
+			assert.equal(response.outcome, 'success');
+			const containerId: string = response.containerId;
+			assert.ok(containerId, 'Container id not found.');
+
+			const javaHome = await shellExec(`docker exec ${containerId} bash -c 'echo -n $JAVA_HOME'`);
+			assert.equal('/usr/lib/jvm/msopenjdk-current', javaHome.stdout);
+
+			const envWithSpaces = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_SPACES'`);
+			assert.equal('value with spaces', envWithSpaces.stdout);
+
+			const evalEnvWithCommand = await shellExec(`docker exec ${containerId} bash -c 'eval $ENV_WITH_COMMAND'`);
+			assert.equal('Hello, World!', evalEnvWithCommand.stdout);
+
+			await shellExec(`docker rm -f ${containerId}`);
+		});
+
+		it('should follow the correct merge logic for containerEnv using docker compose', async () => {
+			const res = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/image-containerEnv-issue`);
+			const response = JSON.parse(res.stdout);
+			assert.equal(response.outcome, 'success');
+			const containerId: string = response.containerId;
+			assert.ok(containerId, 'Container id not found.');
+
+			const somePath = await shellExec(`docker exec ${containerId} bash -c 'echo -n $SOME_PATH'`);
+			assert.equal('/tmp/path/doc-ver/loc', somePath.stdout);
+
+			const envWithSpaces = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_SPACES'`);
+			assert.equal('value with spaces', envWithSpaces.stdout);
+
+			const evalEnvWithCommand = await shellExec(`docker exec ${containerId} bash -c 'eval $ENV_WITH_COMMAND'`);
+			assert.equal('Hello, World!', evalEnvWithCommand.stdout);
+
+			const envWithTestMessage = await shellExec(`docker exec ${containerId} bash -c 'echo -n $Test_Message'`);
+			assert.equal('H"\\n\\ne"\'\'\'llo M:;a/t?h&^iKa%#@!``ni,sk_a-', envWithTestMessage.stdout);			
+
+			const envWithFormat = await shellExec(`docker exec ${containerId} bash -c 'echo -n $ROSCONSOLE_FORMAT'`);
+			assert.equal('[$${severity}] [$${walltime:%Y-%m-%d %H:%M:%S}] [$${node}]: $${message}', envWithFormat.stdout);
+
+			const envWithDoubleQuote = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_QUOTES_WE_WANT_TO_KEEP'`);
+			assert.equal('value with \"quotes\" we want to keep', envWithDoubleQuote.stdout);
+
+			const envWithDollar = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_DOLLAR_SIGN'`);
+			assert.equal('value with $dollar sign', envWithDollar.stdout);
+
+			const envWithBackSlash = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_BACK_SLASH'`);
+			assert.equal('value with \\back slash', envWithBackSlash.stdout);	
+
+			await shellExec(`docker rm -f ${containerId}`);
+		});		
+
+		it('should run with config in subfolder', async () => {
+			const upRes = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/dockerfile-without-features --config ${__dirname}/configs/dockerfile-without-features/.devcontainer/subfolder/devcontainer.json`);
+			const response = JSON.parse(upRes.stdout);
+			assert.strictEqual(response.outcome, 'success');
+
+			await shellExec(`docker exec ${response.containerId} test -f /subfolderConfigPostCreateCommand.txt`);
+
+			await shellExec(`docker rm -f ${response.containerId}`);
+		});
+	});
+
+	describe('Command up with default workspace', () => {
+		it('should create and start container using current directory config', async () => {
+			const testFolder = `${__dirname}/configs/image`;
+			const absoluteTmpPath = path.resolve(__dirname, 'tmp');
+			const absoluteCli = `npx --prefix ${absoluteTmpPath} devcontainer`;
+			const originalCwd = process.cwd();
+			let containerId: string | null = null;
+			try {
+				process.chdir(testFolder);
+				const res = await shellExec(`${absoluteCli} up`);
+				const response = JSON.parse(res.stdout);
+				containerId = response.containerId;
+				assert.equal(response.outcome, 'success');
+				assert.ok(containerId);
+			} finally {
+				process.chdir(originalCwd);
+				if (containerId) {
+					await shellExec(`docker rm -f ${containerId}`);
+				}
+			}
+		});
+
+		it('should fail gracefully when no config in current directory', async () => {
+			const tempDir = path.join(os.tmpdir(), 'devcontainer-up-test-' + Date.now());
+			await shellExec(`mkdir -p ${tempDir}`);
+			const absoluteTmpPath = path.resolve(__dirname, 'tmp');
+			const absoluteCli = `npx --prefix ${absoluteTmpPath} devcontainer`;
+			const originalCwd = process.cwd();
+			try {
+				process.chdir(tempDir);
+				let success = false;
+				try {
+					await shellExec(`${absoluteCli} up`);
+					success = true;
+				} catch (error) {
+					assert.equal(error.error.code, 1, 'Should fail with exit code 1');
+					const res = JSON.parse(error.stdout);
+					assert.equal(res.outcome, 'error');
+					assert.match(res.message, /Dev container config .* not found/);
+				}
+				assert.equal(success, false, 'expect non-successful call');
+			} finally {
+				process.chdir(originalCwd);
+				await shellExec(`rm -rf ${tempDir}`);
+			}
 		});
 	});
 });

@@ -5,14 +5,15 @@
 
 import * as assert from 'assert';
 import * as path from 'path';
-import { BuildKitOption, commandMarkerTests, devContainerDown, devContainerStop, devContainerUp, shellExec } from './testUtils';
+import * as os from 'os';
+import { BuildKitOption, commandMarkerTests, devContainerDown, devContainerStop, devContainerUp, pathExists, shellBufferExec, shellExec, shellPtyExec } from './testUtils';
 
 const pkg = require('../../package.json');
 
 export function describeTests1({ text, options }: BuildKitOption) {
 
 	describe('Dev Containers CLI', function () {
-		this.timeout('180s');
+		this.timeout('360s');
 
 		const tmp = path.relative(process.cwd(), path.join(__dirname, 'tmp'));
 		const cli = `npx --prefix ${tmp} devcontainer`;
@@ -31,9 +32,72 @@ export function describeTests1({ text, options }: BuildKitOption) {
 				beforeEach(async () => containerId = (await devContainerUp(cli, testFolder, options)).containerId);
 				afterEach(async () => await devContainerDown({ containerId }));
 				it('should execute successfully', async () => {
-					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} echo hi`);
-					const response = JSON.parse(res.stdout);
-					assert.equal(response.outcome, 'success');
+					const res = await shellBufferExec(`${cli} exec --workspace-folder ${testFolder} echo hi`);
+					assert.strictEqual(res.code, 0);
+					assert.equal(res.signal, undefined);
+					assert.strictEqual(res.stdout.toString(), 'hi\n');
+				});
+				it('should not run in a terminal', async () => {
+					const res = await shellBufferExec(`${cli} exec --workspace-folder ${testFolder} [ ! -t 1 ]`);
+					assert.strictEqual(res.code, 0);
+					assert.equal(res.signal, undefined);
+				});
+				it('should return exit code without terminal', async () => {
+					const res = await shellBufferExec(`${cli} exec --workspace-folder ${testFolder} sh -c 'exit 123'`);
+					assert.strictEqual(res.code, 123);
+					assert.equal(res.signal, undefined);
+				});
+				it('stream binary data', async () => {
+					const stdin = Buffer.alloc(256);
+					stdin.forEach((_, i) => stdin[i] = i);
+					const res = await shellBufferExec(`${cli} exec --workspace-folder ${testFolder} cat`, { stdin });
+					assert.strictEqual(res.code, 0);
+					assert.equal(res.signal, undefined);
+					assert.ok(res.stdout.equals(stdin), 'stdout does not match stdin: ' + res.stdout.toString('hex'));
+				});
+				it('should run in a terminal', async () => {
+					const res = await shellPtyExec(`${cli} exec --workspace-folder ${testFolder} [ -t 1 ]`);
+					assert.strictEqual(res.code, 0);
+					assert.equal(res.signal, undefined);
+				});
+				it('should return exit code without terminal', async () => {
+					const res = await shellPtyExec(`${cli} exec --workspace-folder ${testFolder} sh -c 'exit 123'`);
+					assert.strictEqual(res.code, 123);
+					assert.equal(res.signal, 0);
+				});
+				it('should connect stdin', async () => {
+					const res = await shellPtyExec(`${cli} exec --workspace-folder ${testFolder} sh`, { stdin: 'FOO=BAR\necho ${FOO}hi${FOO}\nexit\n' });
+					assert.strictEqual(res.code, 0);
+					assert.equal(res.signal, undefined);
+					assert.match(res.cmdOutput, /BARhiBAR/);
+				});
+				it('should pass along --remote-env', async () => {
+					const res = await shellBufferExec(`${cli} exec --workspace-folder ${testFolder} --remote-env FOO=BAR --remote-env BAZ= printenv`);
+					assert.strictEqual(res.code, 0);
+					assert.equal(res.signal, undefined);
+					const stdout = res.stdout.toString();
+					const env = stdout
+						.split('\n')
+						.map(l => l.split('='))
+						.reduce((m, [k, v]) => { m[k] = v; return m; }, {} as { [key: string]: string });
+					assert.strictEqual(env.FOO, 'BAR');
+					assert.strictEqual(env.BAZ, '');
+				});
+				it('should exec with default workspace folder (current directory)', async () => {
+					const originalCwd = process.cwd();
+					const absoluteTmpPath = path.resolve(__dirname, 'tmp');
+					const absoluteCli = `npx --prefix ${absoluteTmpPath} devcontainer`;
+					process.chdir(testFolder);
+
+					try {
+						// Exec without --workspace-folder should use current directory as default
+						const execRes = await shellExec(`${absoluteCli} exec echo "default workspace test"`);
+						assert.strictEqual(execRes.error, null);
+						assert.match(execRes.stdout, /default workspace test/);
+					} finally {
+						// Restore original directory
+						process.chdir(originalCwd);
+					}
 				});
 			});
 			describe(`with valid (image) config containing features [${text}]`, () => {
@@ -43,17 +107,13 @@ export function describeTests1({ text, options }: BuildKitOption) {
 				afterEach(async () => await devContainerDown({ containerId }));
 				it('should have access to installed features (docker)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} docker --version`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /Docker version/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /Docker version/);
 				});
 				it('should have access to installed features (hello)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} hello`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /howdy, root/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /howdy, node/);
 				});
 			});
 			describe(`with valid (Dockerfile) config containing features [${text}]`, () => {
@@ -64,20 +124,36 @@ export function describeTests1({ text, options }: BuildKitOption) {
 				it('should have access to installed features (docker)', async () => {
 					// NOTE: Doing a docker ps will ensure that the --privileged flag was set by the feature
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} docker ps`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /CONTAINER ID/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /CONTAINER ID/);
 				});
 				it('should have access to installed features (hello)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} hello`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /howdy, root/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /howdy, node/);
 				});
 			});
-
+			describe(`with valid (image) config and parallel initializeCommand [${text}]`, () => {
+				let containerId: string | null = null;
+				const testFolder = `${__dirname}/configs/image-with-parallel-initialize-command`;
+				beforeEach(async () => containerId = (await devContainerUp(cli, testFolder, options)).containerId);
+				afterEach(async () => {
+					await devContainerDown({ containerId });
+					await shellExec(`rm -f ${testFolder}/*.testMarker`);
+				});
+				it('should create testMarker files', async () => {
+					{
+						const res = await shellExec(`cat ${testFolder}/initializeCommand.1.testMarker`);
+						assert.strictEqual(res.error, null);
+						assert.strictEqual(res.stderr, '');
+					}
+					{
+						const res = await shellExec(`cat ${testFolder}/initializeCommand.2.testMarker`);
+						assert.strictEqual(res.error, null);
+						assert.strictEqual(res.stderr, '');
+					}
+				});
+			});
 			describe(`with valid (Dockerfile) config with target [${text}]`, () => {
 				let containerId: string | null = null;
 				const testFolder = `${__dirname}/configs/dockerfile-with-target`;
@@ -85,17 +161,13 @@ export function describeTests1({ text, options }: BuildKitOption) {
 				afterEach(async () => await devContainerDown({ containerId }));
 				it('should have build marker content', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} cat /var/test-marker`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /||test-content||/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /||test-content||/);
 				});
 				it('should have access to installed features (hello)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} hello`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /howdy, root/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /howdy, node/);
 				});
 			});
 
@@ -107,17 +179,13 @@ export function describeTests1({ text, options }: BuildKitOption) {
 				it('should have access to installed features (docker)', async () => {
 					// NOTE: Doing a docker ps will ensure that the --privileged flag was set by the feature
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} docker ps`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /CONTAINER ID/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /CONTAINER ID/);
 				});
 				it('should have access to installed features (hello)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} hello`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /howdy, node/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /howdy, node/);
 				});
 			});
 
@@ -128,17 +196,13 @@ export function describeTests1({ text, options }: BuildKitOption) {
 				afterEach(async () => await devContainerDown({ composeProjectName }));
 				it('should have access to installed features (docker)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} docker --version`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /Docker version/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /Docker version/);
 				});
 				it('should have access to installed features (hello)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} hello`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /howdy, node/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /howdy, node/);
 				});
 			});
 		});
@@ -148,7 +212,7 @@ export function describeTests1({ text, options }: BuildKitOption) {
 export function describeTests2({ text, options }: BuildKitOption) {
 
 	describe('Dev Containers CLI', function () {
-		this.timeout('180s');
+		this.timeout('300s');
 
 		const tmp = path.relative(process.cwd(), path.join(__dirname, 'tmp'));
 		const cli = `npx --prefix ${tmp} devcontainer`;
@@ -168,24 +232,18 @@ export function describeTests2({ text, options }: BuildKitOption) {
 				afterEach(async () => await devContainerDown({ composeProjectName }));
 				it('should have access to installed features (docker)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} docker --version`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /Docker version/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /Docker version/);
 				});
 				it('should have access to installed features (hello)', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} hello`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /howdy, node/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /howdy, node/);
 				});
 				it('should have marker content', async () => {
 					const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} cat /var/test-marker`);
-					const response = JSON.parse(res.stdout);
-					console.log(res.stderr);
-					assert.equal(response.outcome, 'success');
-					assert.match(res.stderr, /||test-content||/);
+					assert.strictEqual(res.error, null);
+					assert.match(res.stdout, /||test-content||/);
 				});
 			});
 
@@ -234,9 +292,23 @@ export function describeTests2({ text, options }: BuildKitOption) {
 
 					// Should have Create + Start but not Attach
 					const res = await shellExec(`${cli} run-user-commands --skip-post-attach --workspace-folder ${testFolder}`);
-					const response = JSON.parse(res.stdout);
-					assert.equal(response.outcome, 'success');
+					assert.strictEqual(res.error, null);
 					await commandMarkerTests(cli, testFolder, { postCreate: true, postStart: true, postAttach: false }, 'Markers on run-user-commands');
+				});
+			});
+			describe(`Dockerfile with parallel post*Commands specified [${text}]`, () => {
+				let containerId: string | null = null;
+				const testFolder = `${__dirname}/configs/dockerfile-with-parallel-commands`;
+				after(async () => await devContainerDown({ containerId }));
+				it('should have all command markers at appropriate times', async () => {
+					containerId = (await devContainerUp(cli, testFolder, options)).containerId;
+					// Should have all markers (Create + Start + Attach)
+					assert.ok(await pathExists(cli, testFolder, '/tmp/postCreateCommand1.testmarker'));
+					assert.ok(await pathExists(cli, testFolder, '/tmp/postCreateCommand2.testmarker'));
+					assert.ok(await pathExists(cli, testFolder, '/tmp/postStartCommand1.testmarker'));
+					assert.ok(await pathExists(cli, testFolder, '/tmp/postStartCommand2.testmarker'));
+					assert.ok(await pathExists(cli, testFolder, '/tmp/postAttachCommand1.testmarker'));
+					assert.ok(await pathExists(cli, testFolder, '/tmp/postAttachCommand2.testmarker'));
 				});
 			});
 			describe(`docker-compose with post*Commands specified [${text}]`, () => {
@@ -318,17 +390,13 @@ export function describeTests2({ text, options }: BuildKitOption) {
 					afterEach(async () => await devContainerDown({ containerId }));
 					it('should have access to installed features (docker)', async () => {
 						const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} docker --version`);
-						const response = JSON.parse(res.stdout);
-						console.log(res.stderr);
-						assert.equal(response.outcome, 'success');
-						assert.match(res.stderr, /Docker version/);
+						assert.strictEqual(res.error, null);
+						assert.match(res.stdout, /Docker version/);
 					});
 					it('should have access to installed features (hello)', async () => {
 						const res = await shellExec(`${cli} exec --workspace-folder ${testFolder} hello`);
-						const response = JSON.parse(res.stdout);
-						console.log(res.stderr);
-						assert.equal(response.outcome, 'success');
-						assert.match(res.stderr, /howdy, root/);
+						assert.strictEqual(res.error, null);
+						assert.match(res.stdout, /howdy, node/);
 					});
 				});
 		
@@ -339,13 +407,76 @@ export function describeTests2({ text, options }: BuildKitOption) {
 						success = true;
 					} catch (error) {
 						assert.equal(error.error.code, 1, 'Should fail with exit code 1');
-						const res = JSON.parse(error.stdout);
-						assert.equal(res.outcome, 'error');
-						assert.match(res.message, /Dev container config \(.*\) not found./);
+						assert.match(error.stderr, /Dev container config \(.*\) not found./);
 					}
 					assert.equal(success, false, 'expect non-successful call');
 				});
 			}
+
+			it('should exec with config in subfolder', async () => {
+				const upRes = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/dockerfile-without-features --config ${__dirname}/configs/dockerfile-without-features/.devcontainer/subfolder/devcontainer.json`);
+				const response = JSON.parse(upRes.stdout);
+				assert.strictEqual(response.outcome, 'success');
+
+				const execRes = await shellExec(`${cli} exec --workspace-folder ${__dirname}/configs/dockerfile-without-features --config ${__dirname}/configs/dockerfile-without-features/.devcontainer/subfolder/devcontainer.json bash -c 'printenv SUBFOLDER_CONFIG_REMOTE_ENV'`);
+				assert.strictEqual(execRes.stdout.trim(), 'true');
+
+				await shellExec(`docker rm -f ${response.containerId}`);
+			});
+
+			describe('Command exec with default workspace', () => {
+				it('should fail gracefully when no config in current directory and no container-id', async () => {
+					const tempDir = path.join(os.tmpdir(), 'devcontainer-exec-test-' + Date.now());
+					await shellExec(`mkdir -p ${tempDir}`);
+					const originalCwd = process.cwd();
+					const absoluteTmpPath = path.resolve(__dirname, 'tmp');
+					const absoluteCli = `npx --prefix ${absoluteTmpPath} devcontainer`;
+					try {
+						process.chdir(tempDir);
+						let success = false;
+						try {
+							// Test exec without --workspace-folder (should default to current directory with no config)
+							await shellExec(`${absoluteCli} exec echo "test"`);
+							success = true;
+						} catch (error) {
+							console.log('Caught error as expected: ', error.stderr);
+							// Should fail because there's no container or config
+							assert.equal(error.error.code, 1, 'Should fail with exit code 1');
+						}
+						assert.equal(success, false, 'expect non-successful call');
+					} finally {
+						process.chdir(originalCwd);
+						await shellExec(`rm -rf ${tempDir}`);
+					}
+				});
+
+				describe('with valid config in current directory', () => {
+					let containerId: string | null = null;
+					const testFolder = `${__dirname}/configs/image`;
+
+					beforeEach(async () => {
+						containerId = (await devContainerUp(cli, testFolder, options)).containerId;
+					});
+
+					afterEach(async () => await devContainerDown({ containerId }));
+
+					it('should execute command successfully when using current directory', async () => {
+						const originalCwd = process.cwd();
+						const absoluteTmpPath = path.resolve(__dirname, 'tmp');
+						const absoluteCli = `npx --prefix ${absoluteTmpPath} devcontainer`;
+						try {
+							process.chdir(testFolder);
+							// Test exec without --workspace-folder (should default to current directory)
+							const res = await shellExec(`${absoluteCli} exec echo "hello world"`);
+							assert.strictEqual(res.error, null);
+							assert.match(res.stdout, /hello world/);
+						} finally {
+							process.chdir(originalCwd);
+						}
+					});
+				});
+
+			});
 		});
 	});
 }

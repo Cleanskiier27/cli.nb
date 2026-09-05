@@ -1,9 +1,14 @@
 import { Argv } from 'yargs';
-import { getFeatureRef, getPublishedVersions } from '../../spec-configuration/containerFeaturesOCI';
-import { Log, LogLevel, mapLogLevel } from '../../spec-utils/log';
+import { CommonParams, OCIManifest, OCIRef, fetchOCIManifestIfExists, getPublishedTags, getRef } from '../../spec-configuration/containerCollectionsOCI';
+import { LogLevel, mapLogLevel } from '../../spec-utils/log';
 import { getPackageConfig } from '../../spec-utils/product';
 import { createLog } from '../devContainers';
-import { UnpackArgv } from '../devContainersSpecCLI';
+import { OciAuthArgs, UnpackArgv } from '../devContainersSpecCLI';
+import { buildDependencyGraph, generateMermaidDiagram } from '../../spec-configuration/containerFeaturesOrder';
+import { DevContainerFeature } from '../../spec-configuration/configuration';
+import { processFeatureIdentifier } from '../../spec-configuration/containerFeaturesConfiguration';
+import { runAsyncHandler } from '../utils';
+import { createOCIAuthDiagnostics } from '../../spec-common/ociAuth';
 
 export function featuresInfoOptions(y: Argv) {
 	return y
@@ -11,19 +16,29 @@ export function featuresInfoOptions(y: Argv) {
 			'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level.' },
 			'output-format': { choices: ['text' as 'text', 'json' as 'json'], default: 'text', description: 'Output format.' },
 		})
-		.positional('featureId', { type: 'string', demandOption: true, description: 'Feature Id' });
+		.positional('mode', { choices: ['manifest' as 'manifest', 'tags' as 'tags', 'dependencies' as 'dependencies', 'verbose' as 'verbose'], description: 'Data to query. Select \'verbose\' to return everything.' })
+		.positional('feature', { type: 'string', demandOption: true, description: 'Feature Identifier' });
 }
 
-export type FeaturesInfoArgs = UnpackArgv<ReturnType<typeof featuresInfoOptions>>;
+export type FeaturesInfoArgs = UnpackArgv<ReturnType<typeof featuresInfoOptions>> & OciAuthArgs;
 
 export function featuresInfoHandler(args: FeaturesInfoArgs) {
-	(async () => await featuresInfo(args))().catch(console.error);
+	runAsyncHandler(featuresInfo.bind(null, args));
+}
+
+interface InfoJsonOutput {
+	manifest?: OCIManifest;
+	canonicalId?: string;
+	publishedTags?: string[];
 }
 
 async function featuresInfo({
-	'featureId': featureId,
+	'mode': mode,
+	'feature': featureId,
 	'log-level': inputLogLevel,
 	'output-format': outputFormat,
+	'allow-cross-origin-auth-host': allowedCrossOriginAuthHosts,
+	'oci-auth-hardening': ociAuthHardening,
 }: FeaturesInfoArgs) {
 	const disposables: (() => Promise<unknown> | undefined)[] = [];
 	const dispose = async () => {
@@ -35,40 +50,125 @@ async function featuresInfo({
 	const output = createLog({
 		logLevel: mapLogLevel(inputLogLevel),
 		logFormat: 'text',
-		log: (str) => process.stdout.write(str),
+		log: (str) => process.stderr.write(str),
 		terminalDimensions: undefined,
 	}, pkg, new Date(), disposables, true);
 
-	const featureOciRef = getFeatureRef(output, featureId);
+	const params = { output, env: process.env, outputFormat, allowedCrossOriginAuthHosts, ociAuthHardening, ociAuthDiagnostics: createOCIAuthDiagnostics() };
 
-	const publishedVersions = await getPublishedVersions(featureOciRef, output, true);
-	if (!publishedVersions || publishedVersions.length === 0) {
+	const jsonOutput: InfoJsonOutput = {};
+
+	// Parse the provided Feature Id
+	const featureRef = getRef(output, featureId);
+	if (!featureRef) {
 		if (outputFormat === 'json') {
-			output.raw(JSON.stringify({}), LogLevel.Info);
+			console.log(JSON.stringify({}), LogLevel.Info);
 		} else {
-			output.raw(`No published versions found for feature '${featureId}'\n`, LogLevel.Error);
+			console.log(`Failed to parse Feature identifier '${featureId}'\n`, LogLevel.Error);
 		}
 		process.exit(1);
 	}
 
-	const data: { publishedVersions: string[] } = {
-		publishedVersions
-	};
-
-	if (outputFormat === 'json') {
-		printAsJson(output, data);
-	} else {
-		printAsPlainText(output, data);
+	const manifestContainer = await getManifest(params, featureRef);
+	if (!manifestContainer) {
+		process.exit(1);
 	}
 
+	// -- Display the manifest
+	if (mode === 'manifest' || mode === 'verbose') {
+		const { manifestObj, canonicalId } = manifestContainer;
+		if (outputFormat === 'text') {
+			console.log(encloseStringInBox('Manifest'));
+			console.log(`${JSON.stringify(manifestObj, undefined, 2)}\n`);
+			console.log(encloseStringInBox('Canonical Identifier'));
+			console.log(`${canonicalId}\n`);
+		} else {
+			jsonOutput.manifest = manifestObj;
+			jsonOutput.canonicalId = canonicalId;
+		}
+	}
+
+	// --- Get all published tags for resource
+	if (mode === 'tags' || mode === 'verbose') {
+		const publishedTags = await getTags(params, featureRef);
+		if (outputFormat === 'text') {
+			console.log(encloseStringInBox('Published Tags'));
+			console.log(`${publishedTags.join('\n   ')}`);
+		} else {
+			jsonOutput.publishedTags = publishedTags;
+		}
+	}
+
+	if ((mode === 'dependencies' || mode === 'verbose') && outputFormat === 'text') {
+		output.write(`Building dependency graph for '${featureId}'...`, LogLevel.Info);
+		if (!featureRef) {
+			output.write(`Provide Feature reference '${featureId}' is invalid.`, LogLevel.Error);
+			process.exit(1);
+		}
+
+		const processFeature = async (_userFeature: DevContainerFeature) => {
+			return await processFeatureIdentifier(params, undefined, '', _userFeature);
+		};
+		const graph = await buildDependencyGraph(params, processFeature, [{ userFeatureId: featureId, options: {} }], { overrideFeatureInstallOrder: undefined }, undefined);
+		output.write(JSON.stringify(graph, undefined, 4), LogLevel.Trace);
+		if (!graph) {
+			output.write(`Could not build dependency graph.`, LogLevel.Error);
+			process.exit(1);
+		}
+
+		if (outputFormat === 'text') {
+			console.log(encloseStringInBox('Dependency Tree (Render with https://mermaid.live/)'));
+			const diagram = generateMermaidDiagram(params, graph.worklist);
+			console.log(diagram);
+		}
+	}
+
+	// -- Output and clean up
+	if (outputFormat === 'json') {
+		console.log(JSON.stringify(jsonOutput, undefined, 4));
+	}
 	await dispose();
-	process.exit(0);
+	process.exit();
 }
 
-function printAsJson(output: Log, data: { publishedVersions: string[] }) {
-	output.raw(JSON.stringify(data, null, 2), LogLevel.Info);
+
+async function getManifest(params: CommonParams & { outputFormat: string }, featureRef: OCIRef) {
+	const { outputFormat } = params;
+
+	const manifestContainer = await fetchOCIManifestIfExists(params, featureRef, undefined);
+	if (!manifestContainer) {
+		if (outputFormat === 'json') {
+			console.log(JSON.stringify({}));
+		} else {
+			console.log('No manifest found! If this manifest requires authentication, please login.');
+		}
+		return process.exit(1);
+	}
+	return manifestContainer;
 }
 
-function printAsPlainText(output: Log, data: { publishedVersions: string[] }) {
-	output.raw(`Published Versions: \n   ${data.publishedVersions.join('\n   ')}\n`, LogLevel.Info);
+async function getTags(params: CommonParams & { outputFormat: string }, featureRef: OCIRef) {
+	const { outputFormat } = params;
+	const publishedTags = await getPublishedTags(params, featureRef);
+	if (!publishedTags || publishedTags.length === 0) {
+		if (outputFormat === 'json') {
+			console.log(JSON.stringify({}));
+		} else {
+			console.log(`No published versions found for feature '${featureRef.resource}'\n`);
+		}
+		process.exit(1);
+	}
+	return publishedTags;
+}
+
+function encloseStringInBox(str: string, indent: number = 0) {
+	const lines = str.split('\n');
+	lines[0] = `\u001b[1m${lines[0]}\u001b[22m`; // Bold
+	const maxWidth = Math.max(...lines.map(l => l.length - (l.includes('\u001b[1m') ? 9 : 0)));
+	const box = [
+		'┌' + '─'.repeat(maxWidth) + '┐',
+		...lines.map(l => '│' + l.padEnd(maxWidth + (lines.length > 1 && l.includes('\u001b[1m') ? 9 : 0)) + '│'),
+		'└' + '─'.repeat(maxWidth) + '┘',
+	];
+	return box.map(t => `${' '.repeat(indent)}${t}`).join('\n');
 }

@@ -22,6 +22,8 @@ export const staticProvisionParams = {
     useBuildKit: 'auto' as 'auto',
     buildxPlatform: undefined,
     buildxPush: false,
+    buildxOutput: undefined,
+    buildxCacheTo: undefined,
     skipPostAttach: false,
 };
 
@@ -36,9 +38,9 @@ export const staticExecParams = {
     'override-config': undefined,
     'terminal-rows': undefined,
     'terminal-columns': undefined,
-    'remote-env': undefined,
     'container-id': undefined,
     'mount-workspace-git-root': true,
+    'mount-git-worktree-common-dir': false,
     'log-level': 'info' as 'info',
     'log-format': 'text' as 'text',
     'default-user-env-probe': 'loginInteractiveShell' as 'loginInteractiveShell',
@@ -97,7 +99,7 @@ checkMultiple() {
     shift; MINIMUMPASSED=$1
     shift; EXPRESSION="$1"
     while [ "$EXPRESSION" != "" ]; do
-        if $EXPRESSION; then ((PASSED++)); fi
+        if $EXPRESSION; then ((PASSED+=1)); fi
         shift; EXPRESSION=$1
     done
     if [ $PASSED -ge $MINIMUMPASSED ]; then

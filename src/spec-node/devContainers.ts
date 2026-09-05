@@ -7,19 +7,20 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as os from 'os';
 
-import { DockerResolverParameters, DevContainerAuthority, UpdateRemoteUserUIDDefault, BindMountConsistency, getCacheFolder } from './utils';
-import { createNullPostCreate, finishBackgroundTasks, ResolverParameters, UserEnvProbe } from '../spec-common/injectHeadless';
-import { getCLIHost, loadNativeModule } from '../spec-common/commonUtils';
+import { mapNodeOSToGOOS, mapNodeArchitectureToGOARCH } from '../spec-configuration/containerCollectionsOCI';
+import { createOCIAuthDiagnostics } from '../spec-common/ociAuth';
+import { DockerResolverParameters, DevContainerAuthority, UpdateRemoteUserUIDDefault, BindMountConsistency, getCacheFolder, GPUAvailability } from './utils';
+import { createNullLifecycleHook, finishBackgroundTasks, ResolverParameters, UserEnvProbe } from '../spec-common/injectHeadless';
+import { GoARCH, GoOS, getCLIHost, loadNativeModule } from '../spec-common/commonUtils';
 import { resolve } from './configContainer';
 import { URI } from 'vscode-uri';
-import { promisify } from 'util';
-import { LogLevel, LogDimensions, toErrorText, createCombinedLog, createTerminalLog, Log, makeLog, LogFormat, createJSONLog } from '../spec-utils/log';
+import { LogLevel, LogDimensions, toErrorText, createCombinedLog, createTerminalLog, Log, makeLog, LogFormat, createJSONLog, createPlainLog, LogHandler, replaceAllLog } from '../spec-utils/log';
 import { dockerComposeCLIConfig } from './dockerCompose';
 import { Mount } from '../spec-configuration/containerFeaturesConfiguration';
 import { getPackageConfig, PackageConfiguration } from '../spec-utils/product';
-import { dockerBuildKitVersion } from '../spec-shutdown/dockerUtils';
+import { dockerBuildKitVersion, dockerEngineVersion, lookupCLIVariant, CLIVariant } from '../spec-shutdown/dockerUtils';
+import { Event } from '../spec-utils/event';
 
-export const experimentalImageMetadataDefault = true;
 
 export interface ProvisionOptions {
 	dockerPath: string | undefined;
@@ -28,14 +29,16 @@ export interface ProvisionOptions {
 	containerSystemDataFolder: string | undefined;
 	workspaceFolder: string | undefined;
 	workspaceMountConsistency?: BindMountConsistency;
+	gpuAvailability?: GPUAvailability;
 	mountWorkspaceGitRoot: boolean;
-	idLabels: string[];
+	mountGitWorktreeCommonDir: boolean;
 	configFile: URI | undefined;
 	overrideConfigFile: URI | undefined;
 	logLevel: LogLevel;
 	logFormat: LogFormat;
 	log: (text: string) => void;
 	terminalDimensions: LogDimensions | undefined;
+	onDidChangeTerminalDimensions?: Event<LogDimensions>;
 	defaultUserEnvProbe: UserEnvProbe;
 	removeExistingContainer: boolean;
 	buildNoCache: boolean;
@@ -52,25 +55,47 @@ export interface ProvisionOptions {
 	omitLoggerHeader?: boolean | undefined;
 	buildxPlatform: string | undefined;
 	buildxPush: boolean;
+	additionalLabels: string[];
+	buildxOutput: string | undefined;
+	buildxCacheTo: string | undefined;
+	additionalFeatures?: Record<string, string | boolean | Record<string, string | boolean>>;
 	skipFeatureAutoMapping: boolean;
 	skipPostAttach: boolean;
-	experimentalImageMetadata: boolean;
+	containerSessionDataFolder?: string;
+	skipPersistingCustomizationsFromFeatures: boolean;
+	omitConfigRemotEnvFromMetadata?: boolean;
+	dotfiles: {
+		repository?: string;
+		installCommand?: string;
+		targetPath?: string;
+	};
+	noLockfile?: boolean;
+	frozenLockfile?: boolean;
+	secretsP?: Promise<Record<string, string>>;
+	omitSyntaxDirective?: boolean;
+	includeConfig?: boolean;
+	includeMergedConfig?: boolean;
+	allowedCrossOriginAuthHosts?: string[];
+	ociAuthHardening?: boolean;
 }
 
-export async function launch(options: ProvisionOptions, disposables: (() => Promise<unknown> | undefined)[]) {
+export async function launch(options: ProvisionOptions, providedIdLabels: string[] | undefined, disposables: (() => Promise<unknown> | undefined)[]) {
 	const params = await createDockerParams(options, disposables);
 	const output = params.common.output;
 	const text = 'Resolving Remote';
 	const start = output.start(text);
 
-	const result = await resolve(params, options.configFile, options.overrideConfigFile, options.idLabels);
+	const result = await resolve(params, options.configFile, options.overrideConfigFile, providedIdLabels, options.additionalFeatures ?? {});
 	output.stop(text, start);
 	const { dockerContainerId, composeProjectName } = result;
 	return {
-		containerId: dockerContainerId!,
+		containerId: dockerContainerId,
 		composeProjectName,
 		remoteUser: result.properties.user,
 		remoteWorkspaceFolder: result.properties.remoteWorkspaceFolder,
+		configuration: options.includeConfig ? result.config : undefined,
+		mergedConfiguration: options.includeMergedConfig ? result.mergedConfig : undefined,
+		ociAuthDiagnostics: params.common.ociAuthDiagnostics,
 		finishBackgroundTasks: async () => {
 			try {
 				await finishBackgroundTasks(result.params.backgroundTasks);
@@ -82,7 +107,7 @@ export async function launch(options: ProvisionOptions, disposables: (() => Prom
 }
 
 export async function createDockerParams(options: ProvisionOptions, disposables: (() => Promise<unknown> | undefined)[]): Promise<DockerResolverParameters> {
-	const { persistedFolder, additionalMounts, updateRemoteUserUIDDefault, containerDataFolder, containerSystemDataFolder, workspaceMountConsistency, mountWorkspaceGitRoot, remoteEnv } = options;
+	const { persistedFolder, additionalMounts, updateRemoteUserUIDDefault, containerDataFolder, containerSystemDataFolder, workspaceMountConsistency, gpuAvailability, mountWorkspaceGitRoot, mountGitWorktreeCommonDir, remoteEnv, noLockfile, frozenLockfile, omitLoggerHeader, secretsP } = options;
 	let parsedAuthority: DevContainerAuthority | undefined;
 	if (options.workspaceFolder) {
 		parsedAuthority = { hostPath: options.workspaceFolder } as DevContainerAuthority;
@@ -90,12 +115,13 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 	const extensionPath = path.join(__dirname, '..', '..');
 	const sessionStart = new Date();
 	const pkg = getPackageConfig();
-	const output = createLog(options, pkg, sessionStart, disposables, options.omitLoggerHeader);
+	const output = createLog(options, pkg, sessionStart, disposables, omitLoggerHeader, secretsP ? await secretsP : undefined);
 
 	const appRoot = undefined;
 	const cwd = options.workspaceFolder || process.cwd();
-	const cliHost = await getCLIHost(cwd, loadNativeModule);
-	const sessionId = (await promisify(crypto.randomBytes)(20)).toString('hex'); // TODO: Somehow enable correlation.
+	const allowInheritTTY = options.logFormat === 'text';
+	const cliHost = await getCLIHost(cwd, loadNativeModule, allowInheritTTY);
+	const sessionId = crypto.randomUUID();
 
 	const common: ResolverParameters = {
 		prebuild: options.prebuild,
@@ -115,19 +141,34 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		output,
 		allowSystemConfigChange: true,
 		defaultUserEnvProbe: options.defaultUserEnvProbe,
-		postCreate: createNullPostCreate(options.postCreateEnabled, options.skipNonBlocking, output),
+		lifecycleHook: createNullLifecycleHook(options.postCreateEnabled, options.skipNonBlocking, output),
 		getLogLevel: () => options.logLevel,
 		onDidChangeLogLevel: () => ({ dispose() { } }),
 		loadNativeModule,
+		allowInheritTTY,
 		shutdowns: [],
 		backgroundTasks: [],
 		persistedFolder: persistedFolder || await getCacheFolder(cliHost), // Fallback to tmp folder, even though that isn't 'persistent'
 		remoteEnv,
+		secretsP,
 		buildxPlatform: options.buildxPlatform,
 		buildxPush: options.buildxPush,
+		buildxOutput: options.buildxOutput,
+		buildxCacheTo: options.buildxCacheTo,
 		skipFeatureAutoMapping: options.skipFeatureAutoMapping,
 		skipPostAttach: options.skipPostAttach,
-		experimentalImageMetadata: options.experimentalImageMetadata,
+		containerSessionDataFolder: options.containerSessionDataFolder,
+		skipPersistingCustomizationsFromFeatures: options.skipPersistingCustomizationsFromFeatures,
+		omitConfigRemotEnvFromMetadata: options.omitConfigRemotEnvFromMetadata,
+		dotfilesConfiguration: {
+			repository: options.dotfiles.repository,
+			installCommand: options.dotfiles.installCommand,
+			targetPath: options.dotfiles.targetPath || '~/dotfiles',
+		},
+		omitSyntaxDirective: options.omitSyntaxDirective,
+		allowedCrossOriginAuthHosts: options.allowedCrossOriginAuthHosts,
+		ociAuthHardening: options.ociAuthHardening,
+		ociAuthDiagnostics: createOCIAuthDiagnostics(),
 	};
 
 	const dockerPath = options.dockerPath || 'docker';
@@ -137,21 +178,73 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		env: cliHost.env,
 		output: common.output,
 	}, dockerPath, dockerComposePath);
-	const buildKitVersion = options.useBuildKit === 'never' ? null : (await dockerBuildKitVersion({
+
+	const buildPlatformInfo = {
+		os: mapNodeOSToGOOS(cliHost.platform),
+		arch: mapNodeArchitectureToGOARCH(cliHost.arch),
+	};
+
+	const targetPlatformInfo = (() => {
+		if (common.buildxPlatform) {
+			const slash1 = common.buildxPlatform.indexOf('/');
+			const slash2 = common.buildxPlatform.indexOf('/', slash1 + 1);
+			// `--platform linux/amd64/v3` `--platform linux/arm64/v8`
+			if (slash2 !== -1) {
+				return {
+					os: <GoOS> common.buildxPlatform.slice(0, slash1),
+					arch: <GoARCH> common.buildxPlatform.slice(slash1 + 1, slash2),
+					variant: common.buildxPlatform.slice(slash2 + 1),
+				};
+			}
+			// `--platform linux/amd64` and `--platform linux/arm64`
+			return {
+				os: <GoOS> common.buildxPlatform.slice(0, slash1),
+				arch: <GoARCH> common.buildxPlatform.slice(slash1 + 1),
+			};
+		} else {
+			// `--platform` omitted
+			return {
+				os: mapNodeOSToGOOS(cliHost.platform),
+				arch: mapNodeArchitectureToGOARCH(cliHost.arch),
+			};
+		}
+	})();
+
+	const buildKitVersion = options.useBuildKit === 'never' ? undefined : (await dockerBuildKitVersion({
 		cliHost,
 		dockerCLI: dockerPath,
 		dockerComposeCLI,
 		env: cliHost.env,
-		output
+		output,
+		buildPlatformInfo,
+		targetPlatformInfo,
+		ociAuthDiagnostics: common.ociAuthDiagnostics,
 	}));
+
+	const cliVariant = await lookupCLIVariant({ exec: cliHost.exec, cmd: dockerPath, env: cliHost.env, output });
+
+	const dockerEngineVer = await dockerEngineVersion({
+		cliHost,
+		dockerCLI: dockerPath,
+		dockerComposeCLI,
+		env: cliHost.env,
+		output,
+		buildPlatformInfo,
+		targetPlatformInfo,
+		ociAuthDiagnostics: common.ociAuthDiagnostics,
+	}, { useSimpleVersion: cliVariant === CLIVariant.Wslc });	
+
 	return {
 		common,
 		parsedAuthority,
 		dockerCLI: dockerPath,
+		cliVariant,
 		dockerComposeCLI: dockerComposeCLI,
 		dockerEnv: cliHost.env,
 		workspaceMountConsistencyDefault: workspaceMountConsistency,
+		gpuAvailability: gpuAvailability || 'detect',
 		mountWorkspaceGitRoot,
+		mountGitWorktreeCommonDir,
 		updateRemoteUserUIDOnMacOS: false,
 		cacheMount: 'bind',
 		removeOnStartup: options.removeExistingContainer,
@@ -162,9 +255,17 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		updateRemoteUserUIDDefault,
 		additionalCacheFroms: options.additionalCacheFroms,
 		buildKitVersion,
-		isTTY: process.stdin.isTTY || options.logFormat === 'json',
+		dockerEngineVersion: dockerEngineVer,
+		isTTY: process.stdout.isTTY || options.logFormat === 'json',
+		noLockfile,
+		frozenLockfile,
 		buildxPlatform: common.buildxPlatform,
 		buildxPush: common.buildxPush,
+		additionalLabels: options.additionalLabels,
+		buildxOutput: common.buildxOutput,
+		buildxCacheTo: common.buildxCacheTo,
+		buildPlatformInfo,
+		targetPlatformInfo
 	};
 }
 
@@ -173,23 +274,37 @@ export interface LogOptions {
 	logFormat: LogFormat;
 	log: (text: string) => void;
 	terminalDimensions: LogDimensions | undefined;
+	onDidChangeTerminalDimensions?: Event<LogDimensions>;
 }
 
-export function createLog(options: LogOptions, pkg: PackageConfiguration, sessionStart: Date, disposables: (() => Promise<unknown> | undefined)[], omitHeader?: boolean) {
+export function createLog(options: LogOptions, pkg: PackageConfiguration, sessionStart: Date, disposables: (() => Promise<unknown> | undefined)[], omitHeader?: boolean, secrets?: Record<string, string>) {
 	const header = omitHeader ? undefined : `${pkg.name} ${pkg.version}. Node.js ${process.version}. ${os.platform()} ${os.release()} ${os.arch()}.`;
-	const output = createLogFrom(options, sessionStart, header);
+	const output = createLogFrom(options, sessionStart, header, secrets);
 	output.dimensions = options.terminalDimensions;
+	output.onDidChangeDimensions = options.onDidChangeTerminalDimensions;
 	disposables.push(() => output.join());
 	return output;
 }
 
-function createLogFrom({ log: write, logLevel, logFormat }: LogOptions, sessionStart: Date, header: string | undefined = undefined): Log & { join(): Promise<void> } {
-	const handler = logFormat === 'json' ? createJSONLog(write, () => logLevel, sessionStart) : createTerminalLog(write, () => logLevel, sessionStart);
+function createLogFrom({ log: write, logLevel, logFormat }: LogOptions, sessionStart: Date, header: string | undefined = undefined, secrets?: Record<string, string>): Log & { join(): Promise<void> } {
+	const handler = logFormat === 'json' ? createJSONLog(write, () => logLevel, sessionStart) :
+		process.stdout.isTTY ? createTerminalLog(write, () => logLevel, sessionStart) :
+			createPlainLog(write, () => logLevel);
 	const log = {
-		...makeLog(createCombinedLog([handler], header)),
+		...makeLog(createCombinedLog([maskSecrets(handler, secrets)], header)),
 		join: async () => {
 			// TODO: wait for write() to finish.
 		},
 	};
 	return log;
+}
+
+function maskSecrets(handler: LogHandler, secrets?: Record<string, string>): LogHandler {
+	if (secrets) {
+		const mask = '********';
+		const secretValues = Object.values(secrets);
+		return replaceAllLog(handler, secretValues, mask);
+	}
+
+	return handler;
 }

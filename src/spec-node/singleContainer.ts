@@ -4,22 +4,22 @@
  *--------------------------------------------------------------------------------------------*/
 
 
-import { createContainerProperties, startEventSeen, ResolverResult, getTunnelInformation, getDockerfilePath, getDockerContextPath, DockerResolverParameters, isDockerFileConfig, uriToWSLFsPath, WorkspaceConfiguration, getFolderImageName, inspectDockerImage, ensureDockerfileHasFinalStageName, logUMask, SubstitutedConfig } from './utils';
-import { ContainerProperties, setupInContainer, ResolverProgress } from '../spec-common/injectHeadless';
+import { createContainerProperties, startEventSeen, ResolverResult, getTunnelInformation, getDockerfilePath, getDockerContextPath, DockerResolverParameters, isDockerFileConfig, uriToWSLFsPath, WorkspaceConfiguration, getFolderImageName, inspectDockerImage, logUMask, SubstitutedConfig, checkDockerSupportForGPU, isBuildKitImagePolicyError, isBuildxCacheToInline } from './utils';
+import { ContainerProperties, setupInContainer, ResolverProgress, ResolverParameters } from '../spec-common/injectHeadless';
 import { ContainerError, toErrorText } from '../spec-common/errors';
-import { ContainerDetails, listContainers, DockerCLIParameters, inspectContainers, dockerCLI, dockerPtyCLI, toPtyExecParameters, ImageDetails, toExecParameters } from '../spec-shutdown/dockerUtils';
+import { ContainerDetails, listContainers, DockerCLIParameters, inspectContainers, dockerCLI, dockerPtyCLI, toPtyExecParameters, ImageDetails, toExecParameters, removeContainer, CLIVariant } from '../spec-shutdown/dockerUtils';
 import { DevContainerConfig, DevContainerFromDockerfileConfig, DevContainerFromImageConfig } from '../spec-configuration/configuration';
 import { LogLevel, Log, makeLog } from '../spec-utils/log';
 import { extendImage, getExtendImageBuildInfo, updateRemoteUserUID } from './containerFeatures';
-import { Mount } from '../spec-configuration/containerFeaturesConfiguration';
-import { getDevcontainerMetadata, getImageBuildInfoFromDockerfile, getImageMetadataFromContainer, ImageMetadataEntry } from './imageMetadata';
+import { getDevcontainerMetadata, getImageBuildInfoFromDockerfile, getImageMetadataFromContainer, ImageMetadataEntry, lifecycleCommandOriginMapFromMetadata, mergeConfiguration, MergedDevContainerConfig } from './imageMetadata';
+import { ensureDockerfileHasFinalStageName, generateMountCommand } from './dockerfileUtils';
 
 export const hostFolderLabel = 'devcontainer.local_folder'; // used to label containers created from a workspace/folder
+export const configFileLabel = 'devcontainer.config_file';
 
-export async function openDockerfileDevContainer(params: DockerResolverParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerfileConfig | DevContainerFromImageConfig>, workspaceConfig: WorkspaceConfiguration, idLabels: string[]): Promise<ResolverResult> {
+export async function openDockerfileDevContainer(params: DockerResolverParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerfileConfig | DevContainerFromImageConfig>, workspaceConfig: WorkspaceConfiguration, idLabels: string[], additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>): Promise<ResolverResult> {
 	const { common } = params;
 	const { config } = configWithRaw;
-	// let collapsedFeaturesConfig: () => Promise<CollapsedFeaturesConfig | undefined>;
 
 	let container: ContainerDetails | undefined;
 	let containerProperties: ContainerProperties | undefined;
@@ -27,27 +27,20 @@ export async function openDockerfileDevContainer(params: DockerResolverParameter
 	try {
 		container = await findExistingContainer(params, idLabels);
 		let imageMetadata: ImageMetadataEntry[];
+		let mergedConfig: MergedDevContainerConfig;
 		if (container) {
-			// let _collapsedFeatureConfig: Promise<CollapsedFeaturesConfig | undefined>;
-			// collapsedFeaturesConfig = async () => {
-			// 	return _collapsedFeatureConfig || (_collapsedFeatureConfig = (async () => {
-			// 		const allLabels = container?.Config.Labels || {};
-			// 		const featuresConfig = await generateFeaturesConfig(params.common, (await createFeaturesTempFolder(params.common)), config, async () => allLabels, getContainerFeaturesFolder);
-			// 		return collapseFeaturesConfig(featuresConfig);
-			// 	})());
-			// };
+
 			await startExistingContainer(params, idLabels, container);
-			imageMetadata = getImageMetadataFromContainer(container, configWithRaw, [], common.experimentalImageMetadata, common.output).config;
+			imageMetadata = getImageMetadataFromContainer(container, configWithRaw, undefined, idLabels, common.output).config;
+			mergedConfig = mergeConfiguration(config, imageMetadata);
 		} else {
-			const res = await buildNamedImageAndExtend(params, configWithRaw);
+			const res = await buildNamedImageAndExtend(params, configWithRaw, additionalFeatures, true);
 			imageMetadata = res.imageMetadata.config;
-			const { containerUser } = imageMetadata.reverse().find(m => m.containerUser) || {};
-			const updatedImageName = await updateRemoteUserUID(params, imageMetadata, res.updatedImageName[0], res.imageDetails, findUserArg(config.runArgs) || containerUser);
-
-			// collapsedFeaturesConfig = async () => res.collapsedFeaturesConfig;
-
+			mergedConfig = mergeConfiguration(config, imageMetadata);
+			const { containerUser } = mergedConfig;
+			const updatedImageName = await updateRemoteUserUID(params, mergedConfig, res.updatedImageName[0], res.imageDetails, findUserArg(config.runArgs) || containerUser);
 			try {
-				await spawnDevContainer(params, config, imageMetadata, updatedImageName, idLabels, workspaceConfig.workspaceMount, res.imageDetails, containerUser);
+				await spawnDevContainer(params, config, mergedConfig, updatedImageName, idLabels, workspaceConfig.workspaceMount, workspaceConfig.additionalMountString, res.imageDetails, containerUser, res.labels || {});
 			} finally {
 				// In 'finally' because 'docker run' can fail after creating the container.
 				// Trying to get it here, so we can offer 'Rebuild Container' as an action later.
@@ -58,9 +51,8 @@ export async function openDockerfileDevContainer(params: DockerResolverParameter
 			}
 		}
 
-		const { remoteUser } = imageMetadata.reverse().find(m => m.remoteUser) || {};
-		containerProperties = await createContainerProperties(params, container.Id, workspaceConfig.workspaceFolder, remoteUser);
-		return await setupContainer(container, params, containerProperties, config, imageMetadata);
+		containerProperties = await createContainerProperties(params, container.Id, workspaceConfig.workspaceFolder, mergedConfig.remoteUser);
+		return await setupContainer(container, params, containerProperties, config, mergedConfig, imageMetadata);
 
 	} catch (e) {
 		throw createSetupError(e, container, params, containerProperties, config);
@@ -68,8 +60,14 @@ export async function openDockerfileDevContainer(params: DockerResolverParameter
 }
 
 function createSetupError(originalError: any, container: ContainerDetails | undefined, params: DockerResolverParameters, containerProperties: ContainerProperties | undefined, config: DevContainerConfig | undefined): ContainerError {
+	let description = 'An error occurred setting up the container.';
+
+	if (originalError?.cmdOutput?.includes('docker: Error response from daemon: authorization denied by plugin')) {
+		description = originalError.cmdOutput;
+	}
+
 	const err = originalError instanceof ContainerError ? originalError : new ContainerError({
-		description: 'An error occurred setting up the container.',
+		description,
 		originalError
 	});
 	if (container) {
@@ -87,16 +85,19 @@ function createSetupError(originalError: any, container: ContainerDetails | unde
 	return err;
 }
 
-async function setupContainer(container: ContainerDetails, params: DockerResolverParameters, containerProperties: ContainerProperties, config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig, configs: ImageMetadataEntry[]): Promise<ResolverResult> {
+async function setupContainer(container: ContainerDetails, params: DockerResolverParameters, containerProperties: ContainerProperties, config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig, mergedConfig: MergedDevContainerConfig, imageMetadata: ImageMetadataEntry[]): Promise<ResolverResult> {
 	const { common } = params;
 	const {
 		remoteEnv: extensionHostEnv,
-	} = await setupInContainer(common, containerProperties, config, configs);
+		updatedConfig,
+		updatedMergedConfig,
+	} = await setupInContainer(common, containerProperties, config, mergedConfig, lifecycleCommandOriginMapFromMetadata(imageMetadata));
 
 	return {
 		params: common,
 		properties: containerProperties,
-		config,
+		config: updatedConfig,
+		mergedConfig: updatedMergedConfig,
 		resolvedAuthority: {
 			extensionHostEnv,
 		},
@@ -107,20 +108,20 @@ async function setupContainer(container: ContainerDetails, params: DockerResolve
 }
 
 function getDefaultName(config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig, params: DockerResolverParameters) {
-	return 'image' in config ? config.image : getFolderImageName(params.common);
+	return 'image' in config && config.image ? config.image : getFolderImageName(params.common);
 }
-export async function buildNamedImageAndExtend(params: DockerResolverParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerfileConfig | DevContainerFromImageConfig>, argImageNames?: string[]) {
+export async function buildNamedImageAndExtend(params: DockerResolverParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerfileConfig | DevContainerFromImageConfig>, additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>, canAddLabelsToContainer: boolean, argImageNames?: string[]): Promise<{ updatedImageName: string[]; imageMetadata: SubstitutedConfig<ImageMetadataEntry[]>; imageDetails: () => Promise<ImageDetails>; labels?: Record<string, string> }> {
 	const { config } = configWithRaw;
 	const imageNames = argImageNames ?? [getDefaultName(config, params)];
 	params.common.progress(ResolverProgress.BuildingImage);
 	if (isDockerFileConfig(config)) {
-		return await buildAndExtendImage(params, configWithRaw as SubstitutedConfig<DevContainerFromDockerfileConfig>, imageNames, params.buildNoCache ?? false);
+		return await buildAndExtendImage(params, configWithRaw as SubstitutedConfig<DevContainerFromDockerfileConfig>, imageNames, params.buildNoCache ?? false, additionalFeatures);
 	}
 	// image-based dev container - extend
-	return await extendImage(params, configWithRaw, imageNames[0]);
+	return await extendImage(params, configWithRaw, imageNames[0], argImageNames || [], additionalFeatures, canAddLabelsToContainer);
 }
 
-async function buildAndExtendImage(buildParams: DockerResolverParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerfileConfig>, baseImageNames: string[], noCache: boolean) {
+async function buildAndExtendImage(buildParams: DockerResolverParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerfileConfig>, baseImageNames: string[], noCache: boolean, additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>) {
 	const { cliHost, output } = buildParams.common;
 	const { config } = configWithRaw;
 	const dockerfileUri = getDockerfilePath(cliHost, config);
@@ -145,12 +146,12 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 		}
 	}
 
-	const imageBuildInfo = await getImageBuildInfoFromDockerfile(buildParams, originalDockerfile, configWithRaw.substitute, buildParams.common.experimentalImageMetadata);
-	const extendImageBuildInfo = await getExtendImageBuildInfo(buildParams, configWithRaw, baseName, imageBuildInfo);
+	const imageBuildInfo = await getImageBuildInfoFromDockerfile(buildParams, originalDockerfile, config.build?.args || {}, config.build?.target, configWithRaw.substitute);
+	const extendImageBuildInfo = await getExtendImageBuildInfo(buildParams, configWithRaw, baseName, imageBuildInfo, undefined, additionalFeatures, false);
 
 	let finalDockerfilePath = dockerfilePath;
 	const additionalBuildArgs: string[] = [];
-	if (extendImageBuildInfo) {
+	if (extendImageBuildInfo?.featureBuildInfo) {
 		const { featureBuildInfo } = extendImageBuildInfo;
 		// We add a '# syntax' line at the start, so strip out any existing line
 		const syntaxMatch = dockerfile.match(/^\s*#\s*syntax\s*=.*[\r\n]/g);
@@ -168,6 +169,10 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 		for (const buildArg in featureBuildInfo.buildArgs) {
 			additionalBuildArgs.push('--build-arg', `${buildArg}=${featureBuildInfo.buildArgs[buildArg]}`);
 		}
+
+		for (const securityOpt of featureBuildInfo.securityOpts) {
+			additionalBuildArgs.push('--security-opt', securityOpt);
+		}
 	}
 
 	const args: string[] = [];
@@ -178,14 +183,24 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 	if (buildParams.buildKitVersion) {
 		args.push('buildx', 'build');
 		if (buildParams.buildxPlatform) {
+			output.write('Setting BuildKit platform(s): ' + buildParams.buildxPlatform, LogLevel.Trace);
 			args.push('--platform', buildParams.buildxPlatform);
 		}
 		if (buildParams.buildxPush) {
 			args.push('--push');
 		} else {
-			args.push('--load'); // (short for --output=docker, i.e. load into normal 'docker images' collection)
+			if (buildParams.buildxOutput) { 
+				args.push('--output', buildParams.buildxOutput);
+			} else {
+				args.push('--load'); // (short for --output=docker, i.e. load into normal 'docker images' collection)
+			}
 		}
-		args.push('--build-arg', 'BUILDKIT_INLINE_CACHE=1');
+		if (buildParams.buildxCacheTo) {
+			args.push('--cache-to', buildParams.buildxCacheTo);
+		}
+		if (!isBuildxCacheToInline(buildParams.buildxCacheTo)) {
+			args.push('--build-arg', 'BUILDKIT_INLINE_CACHE=1');
+		}
 	} else {
 		args.push('build');
 	}
@@ -193,7 +208,7 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 
 	baseImageNames.map(imageName => args.push('-t', imageName));
 
-	const target = extendImageBuildInfo ? extendImageBuildInfo.featureBuildInfo.overrideTarget : config.build?.target;
+	const target = extendImageBuildInfo?.featureBuildInfo ? extendImageBuildInfo.featureBuildInfo.overrideTarget : config.build?.target;
 	if (target) {
 		args.push('--target', target);
 	}
@@ -226,6 +241,10 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 			args.push('--build-arg', `${key}=${buildArgs[key]}`);
 		}
 	}
+	const buildOptions = config.build?.options;
+	if (buildOptions?.length) {
+		args.push(...buildOptions);
+	}
 	args.push(...additionalBuildArgs);
 	args.push(await uriToWSLFsPath(getDockerContextPath(cliHost, config), cliHost));
 	try {
@@ -237,6 +256,10 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 			await dockerCLI(infoParams, ...args);
 		}
 	} catch (err) {
+		if (isBuildKitImagePolicyError(err)) {
+			throw new ContainerError({ description: 'Could not resolve image due to policy.', originalError: err, data: { fileWithError: dockerfilePath } });
+		}
+
 		throw new ContainerError({ description: 'An error occurred building the image.', originalError: err, data: { fileWithError: dockerfilePath } });
 	}
 
@@ -244,7 +267,7 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 
 	return {
 		updatedImageName: baseImageNames,
-		imageMetadata: getDevcontainerMetadata(imageBuildInfo.metadata, configWithRaw, extendImageBuildInfo?.collapsedFeaturesConfig?.allFeatures || []),
+		imageMetadata: getDevcontainerMetadata(imageBuildInfo.metadata, configWithRaw, extendImageBuildInfo?.featuresConfig),
 		imageDetails
 	};
 }
@@ -256,7 +279,7 @@ export function findUserArg(runArgs: string[] = []) {
 			return runArgs[i + 1];
 		}
 		if (runArg.startsWith('-u=') || runArg.startsWith('--user=')) {
-			return runArg.substr(runArg.indexOf('=') + 1);
+			return runArg.slice(runArg.indexOf('=') + 1);
 		}
 	}
 	return undefined;
@@ -271,7 +294,7 @@ export async function findExistingContainer(params: DockerResolverParameters, la
 	if (container && (params.removeOnStartup === true || params.removeOnStartup === container.Id)) {
 		const text = 'Removing Existing Container';
 		const start = common.output.start(text);
-		await dockerCLI(params, 'rm', '-f', container.Id);
+		await removeContainer(params, container.Id);
 		common.output.stop(text, start);
 		container = undefined;
 	}
@@ -284,7 +307,8 @@ async function startExistingContainer(params: DockerResolverParameters, labels: 
 	if (start) {
 		const starting = 'Starting container';
 		const start = common.output.start(starting);
-		await dockerCLI(params, 'start', container.Id);
+		const infoParams = { ...toExecParameters(params), output: makeLog(common.output, LogLevel.Info), print: 'continuous' as 'continuous' };
+		await dockerCLI(infoParams, 'start', container.Id);
 		common.output.stop(starting, start);
 		let startedContainer = await findDevContainer(params, labels);
 		if (!startedContainer) {
@@ -300,8 +324,22 @@ export async function findDevContainer(params: DockerCLIParameters | DockerResol
 	return details.filter(container => container.State.Status !== 'removing')[0];
 }
 
+export async function extraRunArgs(common: ResolverParameters, params: DockerResolverParameters, config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig) {
+	const extraArguments: string[] = [];
+	if (config.hostRequirements?.gpu) {
+		if (await checkDockerSupportForGPU(params)) {
+			common.output.write(`GPU support found, add GPU flags to docker call.`);
+			extraArguments.push('--gpus', 'all');
+		} else {
+			if (config.hostRequirements?.gpu !== 'optional') {
+				common.output.write('No GPU support found yet a GPU was required - consider marking it as "optional"', LogLevel.Warning);
+			}
+		}
+	}
+	return extraArguments;
+}
 
-export async function spawnDevContainer(params: DockerResolverParameters, config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig, imageMetadata: ImageMetadataEntry[], imageName: string, labels: string[], workspaceMount: string | undefined, imageDetails: (() => Promise<ImageDetails>) | undefined, containerUser: string | undefined) {
+export async function spawnDevContainer(params: DockerResolverParameters, config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig, mergedConfig: MergedDevContainerConfig, imageName: string, labels: string[], workspaceMount: string | undefined, additionalMountString: string | undefined, imageDetails: () => Promise<ImageDetails>, containerUser: string | undefined, extraLabels: Record<string, string>) {
 	const { common } = params;
 	common.progress(ResolverProgress.StartingContainer);
 
@@ -309,9 +347,10 @@ export async function spawnDevContainer(params: DockerResolverParameters, config
 	const exposedPorts = typeof appPort === 'number' || typeof appPort === 'string' ? [appPort] : appPort || [];
 	const exposed = (<string[]>[]).concat(...exposedPorts.map(port => ['-p', typeof port === 'number' ? `127.0.0.1:${port}:${port}` : port]));
 
-	const cwdMount = workspaceMount ? ['--mount', workspaceMount] : [];
+	const cwdMount = workspaceMount ? (params.cliVariant === CLIVariant.Wslc ? convertMountToVolume(workspaceMount) : ['--mount', workspaceMount]) : [];
+	const additionalMount = additionalMountString ? (params.cliVariant === CLIVariant.Wslc ? convertMountToVolume(additionalMountString) : ['--mount', additionalMountString]) : [];
 
-	const envObj = Object.assign({}, ...imageMetadata.map(m => m.containerEnv));
+	const envObj = mergedConfig.containerEnv || {};
 	const containerEnv = Object.keys(envObj)
 		.reduce((args, key) => {
 			args.push('-e', `${key}=${envObj[key]}`);
@@ -321,43 +360,41 @@ export async function spawnDevContainer(params: DockerResolverParameters, config
 	const containerUserArgs = containerUser ? ['-u', containerUser] : [];
 
 	const featureArgs: string[] = [];
-	if (imageMetadata.some(f => f.init)) {
-		featureArgs.push('--init');
-	}
-	if (imageMetadata.some(f => f.privileged)) {
-		featureArgs.push('--privileged');
-	}
-	const caps = new Set(([] as string[]).concat(...imageMetadata
-		.map(f => f.capAdd || [])));
-	for (const cap of caps) {
-		featureArgs.push('--cap-add', cap);
-	}
-	const securityOpts = new Set(([] as string[]).concat(...imageMetadata
-		.map(f => f.securityOpt || [])));
-	for (const securityOpt of securityOpts) {
-		featureArgs.push('--security-opt', securityOpt);
+	// wslc does not support --init, --privileged, --cap-add, or --security-opt
+	if (params.cliVariant !== CLIVariant.Wslc) {
+		if (mergedConfig.init) {
+			featureArgs.push('--init');
+		}
+		if (mergedConfig.privileged) {
+			featureArgs.push('--privileged');
+		}
+		for (const cap of mergedConfig.capAdd || []) {
+			featureArgs.push('--cap-add', cap);
+		}
+		for (const securityOpt of mergedConfig.securityOpt || []) {
+			featureArgs.push('--security-opt', securityOpt);
+		}
 	}
 
 	const featureMounts = ([] as string[]).concat(
-		...([] as (Mount | string)[]).concat(
-			...imageMetadata
-				.map(f => f.mounts)
-				.filter(Boolean) as (Mount | string)[][],
-			params.additionalMounts,
-		).map(m => ['--mount', typeof m === 'string' ? m : `type=${m.type},src=${m.source},dst=${m.target}`])
+		...[
+			...mergedConfig.mounts || [],
+			...params.additionalMounts,
+		].map(m => {
+			const mountArgs = generateMountCommand(m);
+			return params.cliVariant === CLIVariant.Wslc ? convertMountArgsToVolume(mountArgs) : mountArgs;
+		})
 	);
 
-	const customEntrypoints = imageMetadata
-		.map(f => f.entrypoint)
-		.filter(Boolean) as string[];
+	const customEntrypoints = mergedConfig.entrypoints || [];
 	const entrypoint = ['--entrypoint', '/bin/sh'];
 	const cmd = ['-c', `echo Container started
 trap "exit 0" 15
 ${customEntrypoints.join('\n')}
 exec "$@"
 while sleep 1 & wait $!; do :; done`, '-']; // `wait $!` allows for the `trap` to run (synchronous `sleep` would not).
-	const overrideCommand = imageMetadata.reverse().find(m => typeof m.overrideCommand === 'boolean')?.overrideCommand;
-	if (overrideCommand === false && imageDetails) {
+	const overrideCommand = mergedConfig.overrideCommand;
+	if (overrideCommand === false) {
 		const details = await imageDetails();
 		cmd.push(...details.Config.Entrypoint || []);
 		cmd.push(...details.Config.Cmd || []);
@@ -365,18 +402,20 @@ while sleep 1 & wait $!; do :; done`, '-']; // `wait $!` allows for the `trap` t
 
 	const args = [
 		'run',
-		'--sig-proxy=false',
-		'-a', 'STDOUT',
-		'-a', 'STDERR',
+		...(params.cliVariant === CLIVariant.Wslc ? [] : ['--sig-proxy=false', '-a', 'STDOUT', '-a', 'STDERR']),
 		...exposed,
 		...cwdMount,
+		...additionalMount,
 		...featureMounts,
 		...getLabels(labels),
 		...containerEnv,
 		...containerUserArgs,
+		...await getPodmanArgs(params, config, mergedConfig, imageDetails),
 		...(config.runArgs || []),
+		...(await extraRunArgs(common, params, config) || []),
 		...featureArgs,
 		...entrypoint,
+		...Object.keys(extraLabels).map(key => ['-l', `${key}=${extraLabels[key]}`]).flat(),
 		imageName,
 		...cmd
 	];
@@ -394,6 +433,47 @@ while sleep 1 & wait $!; do :; done`, '-']; // `wait $!` allows for the `trap` t
 
 	await started;
 	common.output.stop(text, start);
+}
+
+async function getPodmanArgs(params: DockerResolverParameters, config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig, mergedConfig: MergedDevContainerConfig, imageDetails: () => Promise<ImageDetails>): Promise<string[]> {
+	if (params.cliVariant === CLIVariant.Podman && params.common.cliHost.platform === 'linux') {
+		const args = ['--security-opt', 'label=disable'];
+		const hasIdMapping = (config.runArgs || []).some(arg => /--[ug]idmap(=|$)/.test(arg));
+		if (!hasIdMapping) {
+			const remoteUser = mergedConfig.remoteUser || findUserArg(config.runArgs) || (await imageDetails()).Config.User || 'root';
+			if (remoteUser !== 'root' && remoteUser !== '0') {
+				args.push('--userns=keep-id');
+			}
+		}
+		return args;
+	}
+	return [];
+}
+
+// Convert a --mount string (e.g., "type=bind,source=/a,target=/b,consistency=cached") to -v syntax for wslc.
+function convertMountToVolume(mountStr: string): string[] {
+	const parts = new Map(mountStr.split(',').map(p => {
+		const eq = p.indexOf('=');
+		return eq === -1 ? [p, ''] : [p.substring(0, eq), p.substring(eq + 1)];
+	}));
+	const source = parts.get('source') || parts.get('src') || '';
+	const target = parts.get('target') || parts.get('dst') || parts.get('destination') || '';
+	if (source && target) {
+		return ['-v', `${source}:${target}`];
+	}
+	if (target) {
+		return ['-v', target];
+	}
+	// Fallback: pass as --mount and let the runtime handle it.
+	return ['--mount', mountStr];
+}
+
+// Convert --mount args array (e.g., ['--mount', 'type=bind,...']) to -v syntax for wslc.
+function convertMountArgsToVolume(args: string[]): string[] {
+	if (args.length === 2 && args[0] === '--mount') {
+		return convertMountToVolume(args[1]);
+	}
+	return args;
 }
 
 function getLabels(labels: string[]): string[] {

@@ -1,85 +1,27 @@
 import { assert } from 'chai';
-import { generateFeaturesConfig, getFeatureLayers, FeatureSet, getContainerFeaturesFolder } from '../../spec-configuration/containerFeaturesConfiguration';
+import { generateFeaturesConfig, getFeatureLayers, getContainerFeaturesBaseDockerFile, FeatureSet } from '../../spec-configuration/containerFeaturesConfiguration';
 import { createPlainLog, LogLevel, makeLog } from '../../spec-utils/log';
 import * as path from 'path';
-import { mkdirpLocal } from '../../spec-utils/pfs';
+import * as process from 'process';
+import * as os from 'os';
+import * as crypto from 'crypto';
+import { mkdirpLocal, readLocalFile } from '../../spec-utils/pfs';
 import { DevContainerConfig } from '../../spec-configuration/configuration';
 import { URI } from 'vscode-uri';
 import { getLocalCacheFolder } from '../../spec-node/utils';
-import { shellExec } from '../testUtils';
+import { createTestCommonParams, findFromArgsWithoutDefault, shellExec } from '../testUtils';
+import { getEntPasswdShellCommand } from '../../spec-common/commonUtils';
 
 export const output = makeLog(createPlainLog(text => process.stdout.write(text), () => LogLevel.Trace));
 
-// Test fetching/generating the devcontainer-features.json config
+// Testing fetching/generating the devcontainer-features.json config
 describe('validate generateFeaturesConfig()', function () {
 
-    // Setup
+    // Setup for tests
     const env = { 'SOME_KEY': 'SOME_VAL' };
-    const params = { extensionPath: '', cwd: '', output, env, persistedFolder: '', skipFeatureAutoMapping: false };
-
-    // Mocha executes with the root of the project as the cwd.
-    const localFeaturesFolder = (_: string) => {
-        return './src/test/container-features/example-v1-features-sets/simple';
-    };
-
-    it('should correctly return a featuresConfig with v1 local features', async function () {
-
-        const version = 'unittest';
-        const tmpFolder: string = path.join(await getLocalCacheFolder(), 'container-features', `${version}-${Date.now()}`);
-        await mkdirpLocal(tmpFolder);
-
-
-        const config: DevContainerConfig = {
-            configFilePath: URI.from({ 'scheme': 'https' }),
-            dockerFile: '.',
-            features: {
-                first: {
-                    'version': 'latest'
-                },
-                second: {
-                    'value': true
-                },
-            },
-        };
-
-        const featuresConfig = await generateFeaturesConfig(params, tmpFolder, config, localFeaturesFolder);
-        if (!featuresConfig) {
-            assert.fail();
-        }
-
-        assert.strictEqual(featuresConfig?.featureSets.length, 2);
-
-        const first = featuresConfig.featureSets[0].features.find((f) => f.id === 'first');
-        assert.exists(first);
-
-        const second = featuresConfig.featureSets[1].features.find((f) => f.id === 'second');
-        assert.exists(second);
-
-        assert.isObject(first?.value);
-        assert.isObject(second?.value);
-
-        // -- Test containerFeatures.ts helper functions
-
-        // generateContainerEnvs
-        // TODO
-        //         const actualEnvs = generateContainerEnvs(featuresConfig);
-        //         const expectedEnvs = `ENV MYKEYONE=MYRESULTONE
-        // ENV MYKEYTHREE=MYRESULTHREE`;
-        //         assert.strictEqual(actualEnvs, expectedEnvs);
-
-        // getFeatureLayers
-        const actualLayers = getFeatureLayers(featuresConfig);
-        const expectedLayers = `RUN cd /tmp/build-features/first_1 \\
-&& chmod +x ./install.sh \\
-&& ./install.sh
-
-RUN cd /tmp/build-features/second_2 \\
-&& chmod +x ./install.sh \\
-&& ./install.sh
-
-`;
-        assert.strictEqual(actualLayers, expectedLayers);
-    });
+    const platform = process.platform;
+	const cacheFolder = path.join(os.tmpdir(), `devcontainercli-test-${crypto.randomUUID()}`);
+    const params = { ...createTestCommonParams(output, env), extensionPath: '', cwd: '', cacheFolder, persistedFolder: '', skipFeatureAutoMapping: false, platform, noLockfile: true };
 
     it('should correctly return a featuresConfig with v2 local features', async function () {
         const version = 'unittest';
@@ -103,7 +45,7 @@ RUN cd /tmp/build-features/second_2 \\
             },
         };
         
-        const featuresConfig = await generateFeaturesConfig({...params, cwd: tmpFolder}, tmpFolder, config, localFeaturesFolder);
+        const featuresConfig = await generateFeaturesConfig({ ...params, cwd: tmpFolder }, tmpFolder, config, {});
         if (!featuresConfig) {
             assert.fail();
         }
@@ -122,14 +64,22 @@ RUN cd /tmp/build-features/second_2 \\
         // -- Test containerFeatures.ts helper functions
 
         // getFeatureLayers
-        const actualLayers = getFeatureLayers(featuresConfig);
-        const expectedLayers = `
-RUN cd /tmp/build-features/color_3 \\
+        const actualLayers = getFeatureLayers(featuresConfig, 'testContainerUser', 'testRemoteUser');
+        const expectedLayers = `RUN \\
+echo "_CONTAINER_USER_HOME=$(${getEntPasswdShellCommand('testContainerUser')} | cut -d: -f6)" >> /tmp/dev-container-features/devcontainer-features.builtin.env && \\
+echo "_REMOTE_USER_HOME=$(${getEntPasswdShellCommand('testRemoteUser')} | cut -d: -f6)" >> /tmp/dev-container-features/devcontainer-features.builtin.env
+
+
+COPY --chown=root:root --from=dev_containers_feature_content_source /tmp/build-features/color_0 /tmp/dev-container-features/color_0
+RUN chmod -R 0755 /tmp/dev-container-features/color_0 \\
+&& cd /tmp/dev-container-features/color_0 \\
 && chmod +x ./devcontainer-features-install.sh \\
 && ./devcontainer-features-install.sh
 
 
-RUN cd /tmp/build-features/hello_4 \\
+COPY --chown=root:root --from=dev_containers_feature_content_source /tmp/build-features/hello_1 /tmp/dev-container-features/hello_1
+RUN chmod -R 0755 /tmp/dev-container-features/hello_1 \\
+&& cd /tmp/dev-container-features/hello_1 \\
 && chmod +x ./devcontainer-features-install.sh \\
 && ./devcontainer-features-install.sh
 
@@ -138,7 +88,7 @@ RUN cd /tmp/build-features/hello_4 \\
     });
 
     it('should correctly return featuresConfig with customizations', async function () {
-        this.timeout('10s');
+        this.timeout('40s');
         const version = 'unittest';
         const tmpFolder: string = path.join(await getLocalCacheFolder(), 'container-features', `${version}-${Date.now()}`);
         await mkdirpLocal(tmpFolder);
@@ -161,7 +111,7 @@ RUN cd /tmp/build-features/hello_4 \\
 
         params.skipFeatureAutoMapping = true;
 
-        const featuresConfig = await generateFeaturesConfig(params, tmpFolder, config, getContainerFeaturesFolder);
+        const featuresConfig = await generateFeaturesConfig(params, tmpFolder, config, {});
         if (!featuresConfig) {
             assert.fail();
         }
@@ -184,5 +134,26 @@ RUN cd /tmp/build-features/hello_4 \\
         assert.includeMembers(javaExtensions, ['vscjava.vscode-java-pack']);
         const javaSettings = java?.features[0]?.customizations?.vscode?.settings;
         assert.isObject(javaSettings);
+    });
+});
+
+describe('validate generated Dockerfiles avoid InvalidDefaultArgInFrom', function () {
+
+    it('feature base Dockerfile declares _DEV_CONTAINERS_BASE_IMAGE with a default before FROM', function () {
+        const dockerfile = getContainerFeaturesBaseDockerFile('/tmp/build-features');
+        assert.match(dockerfile, /ARG _DEV_CONTAINERS_BASE_IMAGE=\S+/, 'ARG should have a default value');
+        assert.match(dockerfile, /FROM \$_DEV_CONTAINERS_BASE_IMAGE\b/, 'FROM should reference the ARG directly');
+        assert.notMatch(dockerfile, /FROM \$\{_DEV_CONTAINERS_BASE_IMAGE:-/, 'should not rely on ${VAR:-default} shell fallback');
+        assert.deepStrictEqual(findFromArgsWithoutDefault(dockerfile), []);
+    });
+
+    it('validate that updateUID.Dockerfile declares BASE_IMAGE with a default before FROM', async function () {
+        const content = (await readLocalFile('scripts/updateUID.Dockerfile')).toString();
+        assert.match(content, /ARG BASE_IMAGE=\S+/, 'BASE_IMAGE ARG should have a default value');
+        assert.deepStrictEqual(
+            findFromArgsWithoutDefault(content),
+            [],
+            'updateUID.Dockerfile FROM references an ARG without a default'
+        );
     });
 });

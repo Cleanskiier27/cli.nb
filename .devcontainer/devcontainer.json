@@ -7,7 +7,7 @@
 	"build": {
 		"dockerfile": "Dockerfile",
 		"args": { 
-			"VARIANT": "16-bullseye"
+			"VARIANT": "20-bookworm"
 		}
 	},
 	"mounts": [
@@ -20,14 +20,15 @@
 	"remoteUser": "node",
 	
 	"features": {
-		"ghcr.io/devcontainers/features/docker-in-docker:1": {}
+		"ghcr.io/devcontainers/features/docker-in-docker:2": {}
 	},
 	
 	"customizations": {
 		"vscode": {
 			"extensions": [
 				"dbaeumer.vscode-eslint",
-				"GitHub.vscode-pull-request-github"
+				"GitHub.vscode-pull-request-github",
+				"hbenl.vscode-mocha-test-adapter"
 			]
 		},
 		"codespaces": {

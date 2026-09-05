@@ -1,46 +1,21 @@
 import { Argv } from 'yargs';
-import { CLIHost, getCLIHost } from '../../spec-common/cliHost';
+import { getCLIHost } from '../../spec-common/cliHost';
 import { loadNativeModule } from '../../spec-common/commonUtils';
-import { Log, mapLogLevel } from '../../spec-utils/log';
+import { mapLogLevel } from '../../spec-utils/log';
 import { getPackageConfig } from '../../spec-utils/product';
 import { createLog } from '../devContainers';
 import { UnpackArgv } from '../devContainersSpecCLI';
 import { doFeaturesPackageCommand } from './packageCommandImpl';
-
-const targetPositionalDescription = `
-Package features at provided [target] (default is cwd), where [target] is either:
-   1. A path to the src folder of the collection with [1..n] features.
-   2. A path to a single feature that contains a devcontainer-feature.json.
-   
-   Additionally, a 'devcontainer-collection.json' will be generated in the output directory.
-`;
+import { PackageCommandInput, PackageOptions } from '../collectionCommonUtils/package';
+import { runAsyncHandler } from '../utils';
 
 export function featuresPackageOptions(y: Argv) {
-	return y
-		.options({
-			'output-folder': { type: 'string', alias: 'o', default: './output', description: 'Path to output directory. Will create directories as needed.' },
-			'force-clean-output-folder': { type: 'boolean', alias: 'f', default: false, description: 'Automatically delete previous output directory before packaging' },
-			'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level.' },
-		})
-		.positional('target', { type: 'string', default: '.', description: targetPositionalDescription })
-		.check(_argv => {
-			return true;
-		});
+	return PackageOptions(y, 'feature');
 }
 
 export type FeaturesPackageArgs = UnpackArgv<ReturnType<typeof featuresPackageOptions>>;
-export interface FeaturesPackageCommandInput {
-	cliHost: CLIHost;
-	targetFolder: string;
-	outputDir: string;
-	output: Log;
-	disposables: (() => Promise<unknown> | undefined)[];
-	isSingleFeature?: boolean; // Packaging a collection of many features. Should autodetect.
-	forceCleanOutputDir?: boolean;
-}
-
 export function featuresPackageHandler(args: FeaturesPackageArgs) {
-	(async () => await featuresPackage(args))().catch(console.error);
+	runAsyncHandler(featuresPackage.bind(null, args));
 }
 
 async function featuresPackage({
@@ -57,16 +32,16 @@ async function featuresPackage({
 	const pkg = getPackageConfig();
 
 	const cwd = process.cwd();
-	const cliHost = await getCLIHost(cwd, loadNativeModule);
+	const cliHost = await getCLIHost(cwd, loadNativeModule, true);
 	const output = createLog({
 		logLevel: mapLogLevel(inputLogLevel),
 		logFormat: 'text',
-		log: (str) => process.stdout.write(str),
+		log: (str) => process.stderr.write(str),
 		terminalDimensions: undefined,
 	}, pkg, new Date(), disposables);
 
 
-	const args: FeaturesPackageCommandInput = {
+	const args: PackageCommandInput = {
 		cliHost,
 		targetFolder,
 		outputDir,

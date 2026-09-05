@@ -6,6 +6,7 @@
 import * as path from 'path';
 import { URI } from 'vscode-uri';
 import { FileHost, parentURI, uriToFsPath } from './configurationCommonUtils';
+import { Mount } from './containerFeaturesConfiguration';
 import { RemoteDocuments } from './editableFiles';
 
 export type DevContainerConfig = DevContainerFromImageConfig | DevContainerFromDockerfileConfig | DevContainerFromDockerComposeConfig;
@@ -20,20 +21,26 @@ export type UserEnvProbe = 'none' | 'loginInteractiveShell' | 'interactiveShell'
 
 export type DevContainerConfigCommand = 'initializeCommand' | 'onCreateCommand' | 'updateContentCommand' | 'postCreateCommand' | 'postStartCommand' | 'postAttachCommand';
 
+export interface HostGPURequirements {
+	cores?: number;
+	memory?: string;
+}
+
 export interface HostRequirements {
 	cpus?: number;
 	memory?: string;
 	storage?: string;
+	gpu?: boolean | 'optional' | HostGPURequirements;
 }
 
 export interface DevContainerFeature {
-	id: string;
+	userFeatureId: string;
 	options: boolean | string | Record<string, boolean | string | undefined>;
 }
 
 export interface DevContainerFromImageConfig {
-	configFilePath: URI;
-	image: string;
+	configFilePath?: URI;
+	image?: string; // Only optional when setting up an existing container as a dev container.
 	name?: string;
 	forwardPorts?: (number | string)[];
 	appPort?: number | string | (number | string)[];
@@ -52,10 +59,14 @@ export interface DevContainerFromImageConfig {
 	/** remote path to folder or workspace */
 	workspaceFolder?: string;
 	workspaceMount?: string;
-	mounts?: string[];
+	mounts?: (Mount | string)[];
 	containerEnv?: Record<string, string>;
-	remoteEnv?: Record<string, string | null>;
 	containerUser?: string;
+	init?: boolean;
+	privileged?: boolean;
+	capAdd?: string[];
+	securityOpt?: string[];
+	remoteEnv?: Record<string, string | null>;
 	remoteUser?: string;
 	updateRemoteUserUID?: boolean;
 	userEnvProbe?: UserEnvProbe;
@@ -85,10 +96,14 @@ export type DevContainerFromDockerfileConfig = {
 	/** remote path to folder or workspace */
 	workspaceFolder?: string;
 	workspaceMount?: string;
-	mounts?: string[];
+	mounts?: (Mount | string)[];
 	containerEnv?: Record<string, string>;
-	remoteEnv?: Record<string, string | null>;
 	containerUser?: string;
+	init?: boolean;
+	privileged?: boolean;
+	capAdd?: string[];
+	securityOpt?: string[];
+	remoteEnv?: Record<string, string | null>;
 	remoteUser?: string;
 	updateRemoteUserUID?: boolean;
 	userEnvProbe?: UserEnvProbe;
@@ -104,6 +119,7 @@ export type DevContainerFromDockerfileConfig = {
 				target?: string;
 				args?: Record<string, string>;
 				cacheFrom?: string | string[];
+				options?: string[];
 			};
 		}
 		|
@@ -114,6 +130,7 @@ export type DevContainerFromDockerfileConfig = {
 				target?: string;
 				args?: Record<string, string>;
 				cacheFrom?: string | string[];
+				options?: string[];
 			};
 		}
 	);
@@ -137,6 +154,13 @@ export interface DevContainerFromDockerComposeConfig {
 	postAttachCommand?: string | string[];
 	waitFor?: DevContainerConfigCommand;
 	runServices?: string[];
+	mounts?: (Mount | string)[];
+	containerEnv?: Record<string, string>;
+	containerUser?: string;
+	init?: boolean;
+	privileged?: boolean;
+	capAdd?: string[];
+	securityOpt?: string[];
 	remoteEnv?: Record<string, string | null>;
 	remoteUser?: string;
 	updateRemoteUserUID?: boolean;

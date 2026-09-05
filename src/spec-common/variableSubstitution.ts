@@ -4,15 +4,16 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as path from 'path';
+import * as crypto from 'crypto';
 
 import { ContainerError } from './errors';
 import { URI } from 'vscode-uri';
 
 export interface SubstitutionContext {
 	platform: NodeJS.Platform;
-	configFile: URI;
-	localWorkspaceFolder: string | undefined;
-	containerWorkspaceFolder: string | undefined;
+	configFile?: URI;
+	localWorkspaceFolder?: string;
+	containerWorkspaceFolder?: string;
 	env: NodeJS.ProcessEnv;
 }
 
@@ -32,6 +33,11 @@ export function substitute<T extends object>(context: SubstitutionContext, value
 	return substitute0(replace, value);
 }
 
+export function beforeContainerSubstitute<T extends object>(idLabels: Record<string, string> | undefined, value: T): T {
+	let devcontainerId: string | undefined;
+	return substitute0(replaceDevContainerId.bind(undefined, () => devcontainerId || (idLabels && (devcontainerId = devcontainerIdForLabels(idLabels)))), value);
+}
+
 export function containerSubstitute<T extends object>(platform: NodeJS.Platform, configFile: URI | undefined, containerEnv: NodeJS.ProcessEnv, value: T): T {
 	const isWindows = platform === 'win32';
 	return substitute0(replaceContainerEnv.bind(undefined, isWindows, configFile, normalizeEnv(isWindows, containerEnv)), value);
@@ -44,7 +50,7 @@ function substitute0(replace: Replace, value: any): any {
 		return resolveString(replace, value);
 	} else if (Array.isArray(value)) {
 		return value.map(s => substitute0(replace, s));
-	} else if (value && typeof value === 'object') {
+	} else if (value && typeof value === 'object' && !URI.isUri(value)) {
 		const result: any = Object.create(null);
 		Object.keys(value).forEach(key => {
 			result[key] = substitute0(replace, value[key]);
@@ -118,6 +124,16 @@ function replaceContainerEnv(isWindows: boolean, configFile: URI | undefined, co
 	}
 }
 
+function replaceDevContainerId(getDevContainerId: () => string | undefined, match: string, variable: string) {
+	switch (variable) {
+		case 'devcontainerId':
+			return getDevContainerId() || match;
+
+		default:
+			return match;
+	}
+}
+
 function lookupValue(isWindows: boolean, envObj: NodeJS.ProcessEnv, args: string[], match: string, configFile: URI | undefined) {
 	if (args.length > 0) {
 		let envVariableName = args[0];
@@ -140,4 +156,16 @@ function lookupValue(isWindows: boolean, envObj: NodeJS.ProcessEnv, args: string
 	throw new ContainerError({
 		description: `'${match}'${configFile ? ` in ${path.posix.basename(configFile.path)}` : ''} can not be resolved because no environment variable name is given.`
 	});
+}
+
+function devcontainerIdForLabels(idLabels: Record<string, string>): string {
+	const stringInput = JSON.stringify(idLabels, Object.keys(idLabels).sort()); // sort properties
+	const bufferInput = Buffer.from(stringInput, 'utf-8');
+	const hash = crypto.createHash('sha256')
+		.update(bufferInput)
+		.digest();
+	const uniqueId = BigInt(`0x${hash.toString('hex')}`)
+		.toString(32)
+		.padStart(52, '0');
+	return uniqueId;
 }
